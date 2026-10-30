@@ -1,0 +1,1172 @@
+
+---
+title: "Análisis univariado y multivariado de germinación en Pisum"
+subtitle: "Análisis estadístico mediante RStudio"
+format:
+  html:
+    toc: true
+    toc-expand: true
+    toc-depth: 4
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  echo: true
+editor_options:
+  chunk_output_type: console
+---
+
+# 1. Configuración del proyecto
+
+```{r}
+#| label: setup
+#| include: false
+
+paquetes <- c(
+  "googlesheets4",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "ggplot2",
+  "ggrepel",
+  "FactoMineR",
+  "factoextra",
+  "ggdendro",
+  "patchwork",
+  "knitr"
+)
+
+faltantes <- paquetes[
+  !vapply(
+    paquetes,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(faltantes) > 0) {
+  install.packages(
+    faltantes,
+    repos = "https://cloud.r-project.org"
+  )
+}
+
+invisible(lapply(
+  paquetes,
+  library,
+  character.only = TRUE
+))
+
+set.seed(123)
+
+# Carpetas para guardar los resultados
+dir_uni <- "resultados/01_Univariado"
+dir_multi <- "resultados/02_Multivariado"
+dir_tablas <- "resultados/03_Tablas"
+
+for (carpeta in c(dir_uni, dir_multi, dir_tablas)) {
+  dir.create(
+    carpeta,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+# Función para guardar gráficos en JPG
+guardar <- function(grafico, nombre, carpeta,
+                    ancho = 24, alto = 18) {
+
+  ggplot2::ggsave(
+    filename = file.path(carpeta, nombre),
+    plot = grafico,
+    width = ancho,
+    height = alto,
+    units = "cm",
+    dpi = 300,
+    bg = "white"
+  )
+}
+```
+
+# 2. Importación de datos desde Google Sheets
+
+```{r}
+#| label: importacion
+
+# Enlace de la base GerminaR
+gs <- paste0(
+  "https://docs.google.com/spreadsheets/d/",
+  "1QziIXGOwb8cl3GaARJq6Ez6aU7vND_UHKJnFcAKx0VI/edit"
+)
+
+# Acceso sin autenticación para hojas públicas
+googlesheets4::gs4_deauth()
+
+# Leer la hoja pisum
+fb <- googlesheets4::read_sheet(
+  ss = gs,
+  sheet = "pisum"
+)
+
+# Revisar columnas requeridas
+dias <- 0:7
+cols_g <- paste0("ger_", dias)
+
+requeridas <- c(
+  "Inoculant", "peg", "block", "seeds",
+  cols_g, "biomasa", "peso"
+)
+
+faltan <- setdiff(requeridas, names(fb))
+
+if (length(faltan) > 0) {
+  stop(
+    "Faltan columnas: ",
+    paste(faltan, collapse = ", ")
+  )
+}
+
+# Preparar las variables
+niveles_peg <- sort(
+  unique(as.numeric(fb$peg))
+)
+
+if (anyNA(niveles_peg)) {
+  stop("La columna peg contiene valores no numéricos.")
+}
+
+fb <- fb %>%
+  mutate(
+    Inoculant = as.factor(Inoculant),
+    peg = factor(
+      as.numeric(peg),
+      levels = niveles_peg
+    ),
+    block = as.factor(block),
+    across(
+      all_of(c("seeds", cols_g, "biomasa", "peso")),
+      as.numeric
+    )
+  )
+
+# Estructura de datos
+str(fb)
+
+# Número de observaciones y variables
+dim(fb)
+
+# Primeras observaciones
+knitr::kable(
+  head(fb),
+  caption = "Base de datos del experimento Pisum"
+)
+```
+
+# 3. Preparación de los índices de germinación
+
+Los registros ger_0 a ger_7 representan la germinación acumulada. Se transforman en conteos diarios para calcular los índices.
+
+```{r}
+#| label: indices-germinacion
+
+acumulados <- as.matrix(
+  fb[, cols_g]
+)
+
+# Validación de conteos
+if (anyNA(acumulados) || anyNA(fb$seeds)) {
+  stop("Existen conteos de germinación faltantes.")
+}
+
+# Convertir registros acumulados a diarios
+diarios <- cbind(
+  acumulados[, 1],
+  acumulados[, 2:8, drop = FALSE] -
+    acumulados[, 1:7, drop = FALSE]
+)
+
+colnames(diarios) <- paste0("nuevo_", dias)
+
+if (any(diarios < 0)) {
+  stop("Los registros acumulados presentan disminuciones.")
+}
+
+if (any(rowSums(diarios) > fb$seeds)) {
+  stop("El total germinado supera las semillas sembradas.")
+}
+
+# Función de índices por unidad experimental
+calcular_indices <- function(x) {
+
+  n <- sum(x)
+
+  if (n == 0) {
+    return(c(
+      tmg = NA_real_,
+      velocidad = 0,
+      incertidumbre = NA_real_,
+      sincronizacion = NA_real_
+    ))
+  }
+
+  # Tiempo medio de germinación (días)
+  tmg <- sum(dias * x) / n
+
+  # Índice de velocidad (semillas/día)
+  velocidad <- sum(x[-1] / dias[-1])
+
+  # Incertidumbre (bits)
+  p <- x[x > 0] / n
+
+  incertidumbre <- -sum(
+    p * log2(p)
+  )
+
+  # Sincronización (0 a 1)
+  sincronizacion <- if (n >= 2) {
+    sum(x * (x - 1) / 2) /
+      (n * (n - 1) / 2)
+  } else {
+    NA_real_
+  }
+
+  c(
+    tmg = tmg,
+    velocidad = velocidad,
+    incertidumbre = incertidumbre,
+    sincronizacion = sincronizacion
+  )
+}
+
+indices <- as.data.frame(
+  t(apply(diarios, 1, calcular_indices))
+)
+
+# Integrar los índices a la base
+datos <- dplyr::bind_cols(
+  fb,
+  tibble::as_tibble(indices)
+) %>%
+  mutate(
+    germinacion_pct =
+      100 * rowSums(diarios) / seeds
+  )
+
+# Variables de respuesta
+variables <- c(
+  "germinacion_pct",
+  "tmg",
+  "velocidad",
+  "incertidumbre",
+  "sincronizacion",
+  "biomasa",
+  "peso"
+)
+
+# Guardar datos procesados
+write.csv(
+  datos,
+  file.path(dir_tablas, "datos_procesados.csv"),
+  row.names = FALSE
+)
+
+knitr::kable(
+  head(
+    datos %>%
+      select(
+        Inoculant, peg, block,
+        all_of(variables)
+      )
+  ),
+  digits = 3,
+  caption = "Índices calculados de germinación"
+)
+```
+
+# 4. Análisis univariado
+
+## 4.1. Estadística descriptiva
+
+```{r}
+#| label: estadistica-descriptiva
+
+resumen_uni <- dplyr::bind_rows(
+  lapply(variables, function(v) {
+
+    x <- datos[[v]]
+
+    data.frame(
+      Variable = v,
+      N = sum(!is.na(x)),
+      Media = mean(x, na.rm = TRUE),
+      Mediana = median(x, na.rm = TRUE),
+      DE = sd(x, na.rm = TRUE),
+      Varianza = var(x, na.rm = TRUE),
+      Minimo = min(x, na.rm = TRUE),
+      Maximo = max(x, na.rm = TRUE)
+    )
+  })
+)
+
+resumen_uni <- resumen_uni %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~round(.x, 3)
+    )
+  )
+
+knitr::kable(
+  resumen_uni,
+  caption = "Estadística descriptiva univariada"
+)
+
+write.csv(
+  resumen_uni,
+  file.path(dir_tablas, "estadistica_descriptiva.csv"),
+  row.names = FALSE
+)
+
+# Tabla de frecuencias de tratamientos
+frecuencias <- datos %>%
+  count(
+    Inoculant,
+    peg,
+    name = "Frecuencia"
+  )
+
+knitr::kable(
+  frecuencias,
+  caption = "Frecuencia de tratamientos"
+)
+```
+
+## 4.2. Histogramas
+
+```{r}
+#| label: histogramas
+
+datos_largos <- datos %>%
+  select(
+    Inoculant,
+    peg,
+    all_of(variables)
+  ) %>%
+  pivot_longer(
+    cols = all_of(variables),
+    names_to = "Variable",
+    values_to = "Valor"
+  )
+
+p_hist <- ggplot(
+  datos_largos,
+  aes(x = Valor)
+) +
+  geom_histogram(
+    bins = 12,
+    fill = "white",
+    color = "darkblue",
+    linewidth = 0.5
+  ) +
+  facet_wrap(
+    ~Variable,
+    scales = "free",
+    ncol = 2
+  ) +
+  labs(
+    title = "Distribución de las variables",
+    x = "Valor observado",
+    y = "Frecuencia"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    )
+  )
+
+guardar(
+  p_hist,
+  "histogramas.jpg",
+  dir_uni,
+  26, 26
+)
+
+p_hist
+```
+
+## 4.3. Diagramas de caja (Boxplot)
+
+```{r}
+#| label: boxplots
+
+p_box <- ggplot(
+  datos_largos,
+  aes(x = Inoculant, y = Valor)
+) +
+  geom_boxplot(
+    fill = "white",
+    color = "darkblue",
+    outlier.color = "red",
+    linewidth = 0.5
+  ) +
+  facet_wrap(
+    ~Variable,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  labs(
+    title = "Distribución por inoculante",
+    x = "Inoculante",
+    y = "Valor observado"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    axis.text.x = element_text(
+      angle = 35,
+      hjust = 1
+    )
+  )
+
+guardar(
+  p_box,
+  "boxplots.jpg",
+  dir_uni,
+  26, 26
+)
+
+p_box
+```
+
+## 4.4. Curvas de germinación
+
+```{r}
+#| label: curvas-germinacion
+
+curva <- fb %>%
+  pivot_longer(
+    cols = all_of(cols_g),
+    names_to = "dia",
+    values_to = "germinadas"
+  ) %>%
+  mutate(
+    dia = as.integer(
+      sub("ger_", "", dia)
+    ),
+    porcentaje =
+      100 * germinadas / seeds
+  ) %>%
+  group_by(
+    Inoculant,
+    peg,
+    dia
+  ) %>%
+  summarise(
+    germinacion = mean(
+      porcentaje,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+p_curva <- ggplot(
+  curva,
+  aes(
+    x = dia,
+    y = germinacion,
+    color = peg,
+    group = peg
+  )
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  facet_wrap(~Inoculant) +
+  labs(
+    title = "Germinación acumulada",
+    x = "Días de evaluación",
+    y = "Germinación (%)",
+    color = "PEG"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    )
+  )
+
+guardar(
+  p_curva,
+  "curva_germinacion.jpg",
+  dir_uni,
+  27, 16
+)
+
+p_curva
+```
+
+# 5. Análisis multivariado
+
+## 5.1. Preparación de la matriz PCA
+
+```{r}
+#| label: preparacion-pca
+
+# Promedios por combinación de tratamientos
+resumen_trat <- datos %>%
+  group_by(
+    Inoculant,
+    peg
+  ) %>%
+  summarise(
+    across(
+      all_of(variables),
+      ~mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Tratamiento = paste(
+      Inoculant,
+      peg,
+      sep = "_PEG"
+    )
+  )
+
+# Crear matriz para PCA
+dtx <- resumen_trat %>%
+  select(
+    Inoculant,
+    peg,
+    all_of(variables)
+  ) %>%
+  as.data.frame()
+
+rownames(dtx) <- resumen_trat$Tratamiento
+
+# Matriz numérica
+matriz <- as.matrix(
+  dtx[, variables, drop = FALSE]
+)
+
+# Comprobaciones
+if (any(!is.finite(matriz))) {
+  stop(
+    "La matriz PCA tiene valores faltantes o infinitos."
+  )
+}
+
+if (any(apply(matriz, 2, sd) == 0)) {
+  stop(
+    "Existen variables sin variación."
+  )
+}
+
+write.csv(
+  resumen_trat,
+  file.path(dir_tablas, "promedios_tratamientos.csv"),
+  row.names = FALSE
+)
+
+knitr::kable(
+  resumen_trat,
+  digits = 3,
+  caption = "Promedios de las combinaciones de tratamientos"
+)
+```
+
+## 5.2. Análisis de componentes principales
+
+```{r}
+#| label: calculo-pca
+
+mv <- FactoMineR::PCA(
+  dtx,
+  scale.unit = TRUE,
+  graph = FALSE,
+  quali.sup = c(1, 2),
+  ncp = 5
+)
+
+# Varianza explicada
+eig <- as.data.frame(mv$eig)
+
+knitr::kable(
+  round(eig, 3),
+  caption = "Valores propios y varianza explicada"
+)
+
+write.csv(
+  eig,
+  file.path(dir_tablas, "varianza_pca.csv")
+)
+
+# Resultados de las variables
+pcainfo <- factoextra::get_pca_var(mv)
+
+write.csv(
+  pcainfo$coord,
+  file.path(dir_tablas, "correlaciones_pca.csv")
+)
+
+write.csv(
+  pcainfo$contrib,
+  file.path(dir_tablas, "contribuciones_pca.csv")
+)
+
+write.csv(
+  pcainfo$cos2,
+  file.path(dir_tablas, "cos2_pca.csv")
+)
+```
+
+## 5.3. PCA de variables
+
+```{r}
+#| label: pca-variables
+
+p_var <- factoextra::fviz_pca_var(
+  mv,
+  col.var = "black",
+  repel = TRUE,
+  labelsize = 3,
+  title = "a) PCA graph of variables"
+) +
+  theme_minimal()
+
+guardar(
+  p_var,
+  "pca_variables.jpg",
+  dir_multi
+)
+
+p_var
+```
+
+## 5.4. PCA de variables según cos2
+
+```{r}
+#| label: pca-cos2
+
+p_cos <- factoextra::fviz_pca_var(
+  mv,
+  col.var = "cos2",
+  gradient.cols = c(
+    "#E9F1F7",
+    "#8DAEC8",
+    "#234A68"
+  ),
+  repel = TRUE,
+  labelsize = 3,
+  title = "b) Variables - PCA (cos2)"
+) +
+  theme_minimal()
+
+guardar(
+  p_cos,
+  "pca_variables_cos2.jpg",
+  dir_multi
+)
+
+p_cos
+```
+
+## 5.5. PCA de individuos por inoculante
+
+```{r}
+#| label: pca-individuos
+
+p_ind <- factoextra::fviz_pca_ind(
+  mv,
+  geom.ind = c("point", "text"),
+  habillage = "Inoculant",
+  palette = c(
+    "#214E74",
+    "#B65F42",
+    "#4E8774"
+  ),
+  repel = TRUE,
+  pointsize = 2.5,
+  labelsize = 3,
+  title = "c) PCA graph of individuals"
+) +
+  theme_minimal()
+
+guardar(
+  p_ind,
+  "pca_individuos_color.jpg",
+  dir_multi,
+  27, 20
+)
+
+p_ind
+```
+
+## 5.6. PCA de individuos en blanco y negro
+
+```{r}
+#| label: pca-individuos-bn
+
+p_ind_bn <- factoextra::fviz_pca_ind(
+  mv,
+  geom.ind = c("point", "text"),
+  habillage = "none",
+  col.ind = "black",
+  repel = TRUE,
+  pointsize = 2.5,
+  labelsize = 3,
+  title = "PCA graph of individuals"
+) +
+  theme_minimal()
+
+guardar(
+  p_ind_bn,
+  "pca_individuos_bn.jpg",
+  dir_multi,
+  27, 20
+)
+
+p_ind_bn
+```
+
+## 5.7. Análisis de conglomerados HCPC
+
+```{r}
+#| label: hcpc
+
+set.seed(123)
+
+cls <- FactoMineR::HCPC(
+  mv,
+  nb.clust = -1,
+  graph = FALSE
+)
+
+tabla_clusters <- data.frame(
+  Tratamiento = rownames(cls$data.clust),
+  Grupo = as.factor(cls$data.clust$clust)
+)
+
+knitr::kable(
+  tabla_clusters,
+  caption = "Asignación de conglomerados"
+)
+
+write.csv(
+  tabla_clusters,
+  file.path(dir_tablas, "clusters.csv"),
+  row.names = FALSE
+)
+
+# Dendrograma jerárquico
+p_dend <- ggdendro::ggdendrogram(
+  cls$call$t$tree,
+  rotate = FALSE,
+  size = 0.5
+) +
+  labs(
+    title = "d) Hierarchical clustering"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 70,
+      hjust = 1,
+      size = 7
+    )
+  )
+
+guardar(
+  p_dend,
+  "clustering.jpg",
+  dir_multi,
+  28, 19
+)
+
+p_dend
+```
+
+## 5.8. Mapa de conglomerados
+
+```{r}
+#| label: mapa-clusters
+
+mapa <- as.data.frame(
+  mv$ind$coord[, 1:2, drop = FALSE]
+) %>%
+  tibble::rownames_to_column(
+    "Tratamiento"
+  ) %>%
+  left_join(
+    tabla_clusters,
+    by = "Tratamiento"
+  )
+
+if (anyNA(mapa$Grupo)) {
+  stop(
+    "No coinciden los nombres de los tratamientos."
+  )
+}
+
+p_mapa <- ggplot(
+  mapa,
+  aes(
+    x = Dim.1,
+    y = Dim.2,
+    color = Grupo,
+    label = Tratamiento
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "gray60"
+  ) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(
+    size = 3,
+    max.overlaps = Inf
+  ) +
+  scale_color_brewer(
+    palette = "Dark2"
+  ) +
+  labs(
+    title = "Conglomerados sobre el plano PCA",
+    x = "Dimensión 1",
+    y = "Dimensión 2"
+  ) +
+  theme_minimal()
+
+guardar(
+  p_mapa,
+  "mapa_clusters.jpg",
+  dir_multi,
+  27, 20
+)
+
+p_mapa
+```
+
+# 6. Panel multivariado completo
+
+Este panel reúne cuatro gráficos como en el ejemplo del profesor.
+
+```{r}
+#| label: panel-multivariado
+
+panel_multi <- (
+  (p_var | p_cos) /
+  (p_ind | p_dend)
+) +
+  patchwork::plot_annotation(
+    title = "Análisis multivariado - Pisum"
+  )
+
+guardar(
+  panel_multi,
+  "multivariate.jpg",
+  dir_multi,
+  ancho = 32,
+  alto = 28
+)
+
+panel_multi
+```
+
+# 7. Información del PCA
+
+## 7.1. Porcentaje de varianza explicada
+
+```{r}
+#| label: varianza-explicada
+
+p_eig <- factoextra::fviz_eig(
+  mv,
+  addlabels = TRUE,
+  barfill = "white",
+  barcolor = "darkblue",
+  linecolor = "red"
+) +
+  labs(
+    title = "a) PCA - Explained variance",
+    x = "Componentes",
+    y = "Varianza (%)"
+  ) +
+  theme_minimal()
+
+guardar(
+  p_eig,
+  "varianza_explicada.jpg",
+  dir_multi
+)
+
+p_eig
+```
+
+## 7.2. Contribución de variables a Dim 1
+
+```{r}
+#| label: contribucion-dim1
+
+p_c1 <- factoextra::fviz_contrib(
+  mv,
+  choice = "var",
+  axes = 1,
+  top = length(variables),
+  fill = "white",
+  color = "darkblue",
+  sort.val = "asc"
+) +
+  coord_flip() +
+  labs(
+    title = "b) Dim 1 - Variables contribution",
+    x = "",
+    y = "Contribución (%)"
+  ) +
+  theme_minimal()
+
+guardar(
+  p_c1,
+  "contribucion_dim1.jpg",
+  dir_multi
+)
+
+p_c1
+```
+
+## 7.3. Contribución de variables a Dim 2
+
+```{r}
+#| label: contribucion-dim2
+
+p_c2 <- factoextra::fviz_contrib(
+  mv,
+  choice = "var",
+  axes = 2,
+  top = length(variables),
+  fill = "white",
+  color = "darkblue",
+  sort.val = "asc"
+) +
+  coord_flip() +
+  labs(
+    title = "c) Dim 2 - Variables contribution",
+    x = "",
+    y = "Contribución (%)"
+  ) +
+  theme_minimal()
+
+guardar(
+  p_c2,
+  "contribucion_dim2.jpg",
+  dir_multi
+)
+
+p_c2
+```
+
+## 7.4. Matriz de calidad de representación cos2
+
+```{r}
+#| label: matriz-cos2
+
+cos_df <- as.data.frame(
+  pcainfo$cos2[, 1:2, drop = FALSE]
+) %>%
+  tibble::rownames_to_column(
+    "Variable"
+  ) %>%
+  pivot_longer(
+    cols = starts_with("Dim"),
+    names_to = "Dimension",
+    values_to = "cos2"
+  )
+
+p_heat <- ggplot(
+  cos_df,
+  aes(
+    x = Dimension,
+    y = Variable,
+    fill = cos2
+  )
+) +
+  geom_tile(
+    color = "white"
+  ) +
+  geom_text(
+    aes(
+      label = sprintf("%.2f", cos2)
+    ),
+    size = 3
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "#873600",
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "d) Calidad de representación",
+    x = "",
+    y = "",
+    fill = "cos2"
+  ) +
+  theme_minimal()
+
+guardar(
+  p_heat,
+  "mapa_cos2.jpg",
+  dir_multi
+)
+
+p_heat
+```
+
+## 7.5. Panel de contribuciones
+
+```{r}
+#| label: panel-contribuciones
+
+panel_contrib <- (
+  (p_eig / p_c1 / p_c2) |
+  p_heat
+) +
+  patchwork::plot_layout(
+    widths = c(1.4, 1)
+  )
+
+guardar(
+  panel_contrib,
+  "contribution.jpg",
+  dir_multi,
+  ancho = 30,
+  alto = 35
+)
+
+panel_contrib
+```
+
+# 8. Resultados e interpretación estadística
+
+## 8.1. Variabilidad explicada
+
+```{r}
+#| label: interpretacion-varianza
+
+var_dim1 <- round(
+  mv$eig[1, 2],
+  2
+)
+
+var_dim2 <- round(
+  mv$eig[2, 2],
+  2
+)
+
+var_total <- round(
+  var_dim1 + var_dim2,
+  2
+)
+
+cat(
+  "Dimensión 1:", var_dim1, "%\n",
+  "Dimensión 2:", var_dim2, "%\n",
+  "Variabilidad conjunta:", var_total, "%\n"
+)
+```
+
+## 8.2. Variables con mayor contribución
+
+```{r}
+#| label: interpretacion-contribuciones
+
+tabla_contrib <- as.data.frame(
+  pcainfo$contrib[, 1:2, drop = FALSE]
+) %>%
+  tibble::rownames_to_column(
+    "Variable"
+  )
+
+knitr::kable(
+  round(
+    tabla_contrib[, -1],
+    3
+  ),
+  caption = "Contribuciones porcentuales"
+)
+
+cat(
+  "Mayor contribución a Dim 1:",
+  tabla_contrib$Variable[
+    which.max(tabla_contrib$Dim.1)
+  ],
+  "\n"
+)
+
+cat(
+  "Mayor contribución a Dim 2:",
+  tabla_contrib$Variable[
+    which.max(tabla_contrib$Dim.2)
+  ],
+  "\n"
+)
+```
+
+## 8.3. Número de individuos por conglomerado
+
+```{r}
+#| label: resumen-clusters
+
+resumen_clusters <- tabla_clusters %>%
+  count(
+    Grupo,
+    name = "Numero_individuos"
+  )
+
+knitr::kable(
+  resumen_clusters,
+  caption = "Número de individuos por conglomerado"
+)
+```
+
+# 9. Archivos generados
+
+```{r}
+#| label: archivos
+
+archivos <- list.files(
+  "resultados",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+knitr::kable(
+  data.frame(Archivo = archivos),
+  caption = "Archivos exportados"
+)
+
+cat(
+  "Ubicación de resultados:",
+  normalizePath("resultados")
+)
+```
+
+# Referencias
+
+FactoMineR. (s. f.). *Multivariate exploratory data analysis and data mining*. https://cran.r-project.org/package=FactoMineR
+
+Factoextra. (s. f.). *Extract and visualize the results of multivariate data analyses*. https://cran.r-project.org/package=factoextra
+
+GerminaR. (s. f.). *Indices and graphics for assess seed germination process*. https://germinar.inkaverse.com/
+
